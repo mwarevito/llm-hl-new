@@ -1,0 +1,21 @@
+# Environment variables (Sensitive!)
+.env
+.env.local
+
+# Data and Logs
+data/
+logs/
+backtest/
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.pytest_cache/
+
+# IDE
+.vscode/
+.idea/
+
+# System
+.DS_Store

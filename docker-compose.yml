@@ -1,0 +1,21 @@
+version: '3.8'
+
+services:
+  trading-bot:
+    build: .
+    container_name: hyperliquid-bot
+    restart: unless-stopped
+    environment:
+      - RUN_MODE=continuous
+      # Map other env vars from .env file
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./backtest:/app/backtest
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
