@@ -291,10 +291,26 @@ class MarketDataCollector:
                 bids = book.get('bids', [])
                 asks = book.get('asks', [])
 
-            best_bid = float(bids[0][0]) if bids and len(bids[0]) > 0 else float(df['close'].iloc[-1])
-            best_ask = float(asks[0][0]) if asks and len(asks[0]) > 0 else float(df['close'].iloc[-1])
-            bid_depth = sum([float(b[1]) for b in bids[:10] if len(b) > 1])
-            ask_depth = sum([float(a[1]) for a in asks[:10] if len(a) > 1])
+            # Check if bids/asks are list of lists or list of dicts
+            if bids and isinstance(bids[0], dict):
+                best_bid = float(bids[0]['px'])
+                bid_depth = sum([float(b['sz']) for b in bids[:10]])
+            elif bids:
+                best_bid = float(bids[0][0])
+                bid_depth = sum([float(b[1]) for b in bids[:10]])
+            else:
+                best_bid = float(df['close'].iloc[-1])
+                bid_depth = 0
+
+            if asks and isinstance(asks[0], dict):
+                best_ask = float(asks[0]['px'])
+                ask_depth = sum([float(a['sz']) for a in asks[:10]])
+            elif asks:
+                best_ask = float(asks[0][0])
+                ask_depth = sum([float(a[1]) for a in asks[:10]])
+            else:
+                best_ask = float(df['close'].iloc[-1])
+                ask_depth = 0
         except (KeyError, IndexError, TypeError) as e:
             logger.warning(f"Failed to parse orderbook, using close price: {e}")
             # Fallback to last close price
@@ -1094,8 +1110,8 @@ if __name__ == "__main__":
         symbol="BTC",
         position_size_pct=10.0,  # 10% of account per trade
         check_interval_seconds=300,  # 5 minutes
-        llm_provider="openai",  # or "anthropic"
-        llm_model="gpt-4o",  # or "claude-3-5-sonnet-20241022"
+        llm_provider=os.getenv("LLM_PROVIDER", "openai"),
+        llm_model=os.getenv("LLM_MODEL", "gpt-4o-mini"),
         max_daily_loss_pct=5.0,  # Circuit breaker at 5% daily loss
         max_spread_bps=50.0  # Max 0.5% spread
     )
