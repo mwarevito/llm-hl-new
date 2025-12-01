@@ -2,6 +2,8 @@ import os
 import json
 import time
 import traceback
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, timedelta
 from typing import Dict, Optional, List
 from dataclasses import dataclass
@@ -1059,7 +1061,34 @@ class LLMTradingAgent:
                 time.sleep(60)
 
 
+# Health check endpoint for Railway
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == '/' or self.path == '/health':
+            self.send_response(200)
+            self.send_header('Content-type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(b'OK')
+        else:
+            self.send_response(404)
+            self.end_headers()
+    
+    def log_message(self, format, *args):
+        # Suppress healthcheck logs
+        pass
+
+def start_health_server(port=8080):
+    """Start health check HTTP server in background thread"""
+    server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    logger.info(f"Health check server started on port {port}")
+
+
 if __name__ == "__main__":
+    # Start health check server for Railway
+    start_health_server(port=int(os.getenv('PORT', 8080)))
+    
     # Improved agent with safety features
     agent = LLMTradingAgent(
         symbol="BTC",
