@@ -1101,6 +1101,18 @@ class HyperliquidExecutor:
                 reduce_only=True
             )
             logger.info(f"SL order placed: {sl_order}")
+
+    def _cancel_all_orders(self, symbol: str):
+        """Cancel all open orders for a symbol"""
+        try:
+            open_orders = self.info.open_orders(os.getenv("HYPERLIQUID_ADDRESS"))
+            for order in open_orders:
+                if order['coin'] == symbol:
+                    self.exchange.cancel(order['coin'], order['oid'])
+                    logger.info(f"Cancelled order {order['oid']}")
+        except Exception as e:
+            logger.warning(f"Failed to cancel orders: {e}")
+
         except Exception as e:
             logger.error(f"Failed to place SL order: {e}")
 
@@ -1118,16 +1130,14 @@ class HyperliquidExecutor:
             logger.info(f"Closing {position['side']} position: {position['size']} {symbol}")
 
             # Cancel any existing TP/SL orders first
-            try:
-                self.exchange.cancel_all(symbol)
-                logger.info("Cancelled existing orders")
-            except Exception as e:
-                logger.warning(f"Failed to cancel orders: {e}")
+            self._cancel_all_orders(symbol)
 
-            order = self.exchange.market_close(
-                name=symbol,
-                sz=position['size']
-            )
+            # Round size
+            rounded_size = self._round_size(symbol, position['size'])
+
+            # Close position
+            # market_close(coin_name, sz=None) -> if sz is None, closes full position
+            order = self.exchange.market_close(symbol, sz=rounded_size)
 
             logger.success(f"Position closed: {order}")
             logger.info(f"Final P&L: {position['pnl_pct']:.2f}% (${position['pnl_usd']:.2f})")
