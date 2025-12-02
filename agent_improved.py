@@ -15,7 +15,9 @@ import numpy as np
 # Hyperliquid
 from hyperliquid.info import Info
 from hyperliquid.exchange import Exchange
+from hyperliquid.exchange import Exchange
 from hyperliquid.utils import constants
+from eth_account import Account
 
 # Technical indicators
 import ta
@@ -826,9 +828,10 @@ class HyperliquidExecutor:
         )
 
         # Set private key
+        # Set private key
         private_key = os.getenv("HYPERLIQUID_PRIVATE_KEY")
         if private_key:
-            self.exchange.wallet = private_key
+            self.exchange.wallet = Account.from_key(private_key)
 
         self.info = Info(url, skip_ws=True)
 
