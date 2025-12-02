@@ -936,6 +936,7 @@ class HyperliquidExecutor:
 
         except Exception as e:
             logger.error(f"Trade execution failed: {e}")
+            logger.error(traceback.format_exc())
             return False
 
     def _open_position(self, symbol: str, side: str, size_coins: float,
@@ -945,15 +946,38 @@ class HyperliquidExecutor:
         # Get current orderbook
         book = self.info.l2_snapshot(symbol)
 
-        # FIXED: Use correct price for market orders
-        # For LONG: use ask price (buying)
-        # For SHORT: use bid price (selling)
-        if side == 'OPEN_LONG':
-            execution_price = float(book['levels'][1][0][0]) if book['levels'][1] else 0  # Ask price
-            is_buy = True
-        else:  # OPEN_SHORT
-            execution_price = float(book['levels'][0][0][0]) if book['levels'][0] else 0  # Bid price
-            is_buy = False
+        # Robust orderbook parsing (copied from MarketDataCollector)
+        try:
+            if 'levels' in book and isinstance(book['levels'], list) and len(book['levels']) >= 2:
+                bids = book['levels'][0] if book['levels'][0] else []
+                asks = book['levels'][1] if book['levels'][1] else []
+            else:
+                bids = book.get('bids', [])
+                asks = book.get('asks', [])
+
+            # Determine execution price based on side
+            if side == 'OPEN_LONG':
+                # Buy at best ask
+                if asks and isinstance(asks[0], dict):
+                    execution_price = float(asks[0]['px'])
+                elif asks:
+                    execution_price = float(asks[0][0])
+                else:
+                    execution_price = 0
+                is_buy = True
+            else:  # OPEN_SHORT
+                # Sell at best bid
+                if bids and isinstance(bids[0], dict):
+                    execution_price = float(bids[0]['px'])
+                elif bids:
+                    execution_price = float(bids[0][0])
+                else:
+                    execution_price = 0
+                is_buy = False
+
+        except Exception as e:
+            logger.error(f"Failed to parse orderbook for execution: {e}")
+            return False
 
         if execution_price <= 0:
             logger.error("Invalid orderbook data")
