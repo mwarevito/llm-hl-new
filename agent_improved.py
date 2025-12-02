@@ -1101,6 +1101,8 @@ class HyperliquidExecutor:
                 reduce_only=True
             )
             logger.info(f"SL order placed: {sl_order}")
+        except Exception as e:
+            logger.error(f"Failed to place SL order: {e}")
 
     def _cancel_all_orders(self, symbol: str):
         """Cancel all open orders for a symbol"""
@@ -1112,9 +1114,6 @@ class HyperliquidExecutor:
                     logger.info(f"Cancelled order {order['oid']}")
         except Exception as e:
             logger.warning(f"Failed to cancel orders: {e}")
-
-        except Exception as e:
-            logger.error(f"Failed to place SL order: {e}")
 
     def _close_position(self, symbol: str) -> bool:
         """Close existing position"""
