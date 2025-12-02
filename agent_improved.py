@@ -380,6 +380,7 @@ class MarketDataCollector:
         # Volume analysis
         volume_ma_20 = volume.rolling(20).mean().iloc[-1]
         volume_ratio = volume.iloc[-1] / volume_ma_20 if volume_ma_20 > 0 else 1.0
+        logger.info(f"Volume debug - Current: {volume.iloc[-1]:.2f}, MA(20): {volume_ma_20:.2f}, Ratio: {volume_ratio:.2f}")
 
         # Price momentum
         returns_24h = ((close.iloc[-1] - close.iloc[-24]) / close.iloc[-24] * 100) if len(close) >= 24 else 0
@@ -567,7 +568,7 @@ Respond ONLY with valid JSON in this exact format:
 }}
 
 CRITICAL RULES:
-- Only suggest OPEN_LONG/OPEN_SHORT if confidence > 0.75
+- Only suggest OPEN_LONG/OPEN_SHORT if confidence > 0.65
 - take_profit_pct should be based on ATR (typically {ind['atr_pct']*2.5:.2f}% to {ind['atr_pct']*4:.2f}%)
 - stop_loss_pct should be based on ATR (typically {ind['atr_pct']*1.5:.2f}% to {ind['atr_pct']*2.5:.2f}%)
 - Ensure TP/SL ratio is at least 1.5:1
