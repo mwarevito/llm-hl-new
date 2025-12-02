@@ -887,14 +887,29 @@ class HyperliquidExecutor:
                         size = float(pos['position']['szi'])
                         if size != 0:
                             entry_price = float(pos['position']['entryPx'])
-                            current_price = float(pos['position']['markPx'])
-                            pnl_pct = ((current_price - entry_price) / entry_price) * 100
+                            
+                            # Get current price (markPx might be missing)
+                            if 'markPx' in pos['position']:
+                                current_price = float(pos['position']['markPx'])
+                            else:
+                                # Fallback: fetch current price from all_mids
+                                try:
+                                    all_mids = self.info.all_mids()
+                                    current_price = float(all_mids.get(symbol, entry_price))
+                                except Exception:
+                                    current_price = entry_price
 
-                            # Calculate PnL in USD
-                            if size > 0:  # Long
-                                pnl_usd = (current_price - entry_price) * size
-                            else:  # Short
-                                pnl_usd = (entry_price - current_price) * abs(size)
+                            # Calculate PnL
+                            # Prefer authoritative unrealizedPnl if available
+                            if 'unrealizedPnl' in pos['position']:
+                                pnl_usd = float(pos['position']['unrealizedPnl'])
+                            else:
+                                if size > 0:  # Long
+                                    pnl_usd = (current_price - entry_price) * size
+                                else:  # Short
+                                    pnl_usd = (entry_price - current_price) * abs(size)
+
+                            pnl_pct = ((current_price - entry_price) / entry_price) * 100 if size > 0 else ((entry_price - current_price) / entry_price) * 100
 
                             return {
                                 'symbol': symbol,
