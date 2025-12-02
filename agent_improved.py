@@ -989,7 +989,7 @@ class HyperliquidExecutor:
         try:
             # Place market order
             order = self.exchange.market_open(
-                coin=symbol,
+                name=symbol,
                 is_buy=is_buy,
                 sz=size_coins,
                 px=None  # Market order
@@ -1034,7 +1034,7 @@ class HyperliquidExecutor:
         # Take Profit (limit order on opposite side)
         try:
             tp_order = self.exchange.order(
-                coin=symbol,
+                name=symbol,
                 is_buy=not is_buy,  # Opposite side to close
                 sz=size,
                 limit_px=tp_price,
@@ -1048,7 +1048,7 @@ class HyperliquidExecutor:
         # Stop Loss (trigger order)
         try:
             sl_order = self.exchange.order(
-                coin=symbol,
+                name=symbol,
                 is_buy=not is_buy,  # Opposite side to close
                 sz=size,
                 limit_px=sl_price,
@@ -1080,7 +1080,7 @@ class HyperliquidExecutor:
                 logger.warning(f"Failed to cancel orders: {e}")
 
             order = self.exchange.market_close(
-                coin=symbol,
+                name=symbol,
                 sz=position['size']
             )
 
