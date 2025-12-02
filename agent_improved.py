@@ -200,7 +200,9 @@ class PerformanceTracker:
                 'total_trades': 0,
                 'win_rate': 0.0,
                 'avg_pnl_pct': 0.0,
-                'total_pnl_usd': 0.0
+                'total_pnl_usd': 0.0,
+                'best_trade_pct': 0.0,
+                'worst_trade_pct': 0.0
             }
 
         winning_trades = [t for t in self.trades if t['pnl_usd'] > 0]
