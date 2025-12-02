@@ -198,7 +198,11 @@ class PerformanceTracker:
         if not self.trades:
             return {
                 'total_trades': 0,
+                'winning_trades': 0,
+                'losing_trades': 0,
                 'win_rate': 0.0,
+                'avg_win_usd': 0.0,
+                'avg_loss_usd': 0.0,
                 'avg_pnl_pct': 0.0,
                 'total_pnl_usd': 0.0,
                 'best_trade_pct': 0.0,
@@ -350,10 +354,22 @@ class MarketDataCollector:
         # Moving Averages
         ma_20 = close.rolling(20).mean().iloc[-1]
         ma_50 = close.rolling(50).mean().iloc[-1]
+        current_price = close.iloc[-1]
 
-        # Trend direction
-        trend = "BULLISH" if ma_20 > ma_50 else "BEARISH"
-        trend_strength = abs((ma_20 - ma_50) / ma_50 * 100)
+        # FIXED: Trend direction based on PRICE vs MAs, not MA crossover
+        price_vs_ma20 = ((current_price - ma_20) / ma_20 * 100)
+        price_vs_ma50 = ((current_price - ma_50) / ma_50 * 100)
+
+        # Price above both MAs = bullish, below both = bearish
+        if current_price > ma_20 and current_price > ma_50:
+            trend = "BULLISH"
+        elif current_price < ma_20 and current_price < ma_50:
+            trend = "BEARISH"
+        else:
+            trend = "MIXED"
+
+        # Trend strength based on how far price is from MAs
+        trend_strength = abs(price_vs_ma20)
 
         # RSI
         rsi = ta.momentum.RSIIndicator(close, window=14).rsi().iloc[-1]
@@ -385,11 +401,66 @@ class MarketDataCollector:
         # Price momentum
         returns_24h = ((close.iloc[-1] - close.iloc[-24]) / close.iloc[-24] * 100) if len(close) >= 24 else 0
 
+        # Price momentum over 10 hours (for regime detection)
+        returns_10h = ((close.iloc[-1] - close.iloc[-10]) / close.iloc[-10] * 100) if len(close) >= 10 else 0
+
+        # MARKET REGIME DETECTION
+        # Momentum regime: strong directional move with volume
+        # Mean reversion regime: range-bound, low momentum
+        # Transitional: mixed signals
+
+        momentum_score = 0
+
+        # Factor 1: Price change magnitude (10h)
+        if abs(returns_10h) > 3.0:  # >3% move in 10 hours
+            momentum_score += 2
+        elif abs(returns_10h) > 1.5:  # >1.5% move
+            momentum_score += 1
+
+        # Factor 2: RSI trending (not bouncing at extremes)
+        if rsi > 60 and returns_10h > 0:  # Strong bullish momentum
+            momentum_score += 2
+        elif rsi < 40 and returns_10h < 0:  # Strong bearish momentum
+            momentum_score += 2
+        elif 30 <= rsi <= 70:  # RSI in middle = ranging
+            momentum_score -= 1
+
+        # Factor 3: Bollinger Band position
+        if bb_position > 0.8 or bb_position < 0.2:  # Near extremes
+            if abs(returns_10h) > 2.0:  # With momentum = breakout
+                momentum_score += 2
+            else:  # Without momentum = reversal zone
+                momentum_score -= 1
+
+        # Factor 4: Volume confirmation
+        if volume_ratio > 1.3:  # High volume supports momentum
+            momentum_score += 1
+        elif volume_ratio < 0.7:  # Low volume = ranging
+            momentum_score -= 1
+
+        # Factor 5: Trend alignment
+        if trend == "BULLISH" and returns_10h > 1.0:
+            momentum_score += 1
+        elif trend == "BEARISH" and returns_10h < -1.0:
+            momentum_score += 1
+        elif trend == "MIXED":
+            momentum_score -= 1
+
+        # Determine market regime
+        if momentum_score >= 4:
+            market_regime = "MOMENTUM"
+        elif momentum_score <= 1:
+            market_regime = "RANGING"
+        else:
+            market_regime = "TRANSITIONAL"
+
         indicators = {
             'ma_20': float(ma_20),
             'ma_50': float(ma_50),
             'trend': trend,
             'trend_strength_pct': float(trend_strength),
+            'price_vs_ma20_pct': float(price_vs_ma20),
+            'price_vs_ma50_pct': float(price_vs_ma50),
             'rsi_14': float(rsi),
             'macd': float(macd),
             'macd_signal': float(macd_signal),
@@ -401,7 +472,10 @@ class MarketDataCollector:
             'atr': float(atr),
             'atr_pct': float(atr_pct),
             'volume_ratio': float(volume_ratio),
-            'returns_24h_pct': float(returns_24h)
+            'returns_24h_pct': float(returns_24h),
+            'returns_10h_pct': float(returns_10h),
+            'market_regime': market_regime,
+            'momentum_score': momentum_score
         }
 
         return indicators
@@ -495,12 +569,18 @@ MARKET DATA FOR {market_data['symbol']}:
 - Current Price: ${market_data['current_price']:.2f}
 - Timestamp: {market_data['timestamp']}
 
+🎯 MARKET REGIME: {ind['market_regime']} (Score: {ind.get('momentum_score', 0)})
+- MOMENTUM: Strong directional move - trade with the trend, RSI 70-80 is normal
+- RANGING: Sideways choppy action - mean reversion, buy dips/sell rallies
+- TRANSITIONAL: Mixed signals - wait for clarity or reduce position size
+
 TREND ANALYSIS:
 - Trend Direction: {ind['trend']}
 - Trend Strength: {ind['trend_strength_pct']:.2f}%
 - MA(20): ${ind['ma_20']:.2f}
 - MA(50): ${ind['ma_50']:.2f}
-- Price vs MA(20): {((market_data['current_price'] - ind['ma_20']) / ind['ma_20'] * 100):.2f}%
+- Price vs MA(20): {ind['price_vs_ma20_pct']:.2f}%
+- Price vs MA(50): {ind['price_vs_ma50_pct']:.2f}%
 
 MOMENTUM INDICATORS:
 - RSI(14): {ind['rsi_14']:.2f} [{self._rsi_interpretation(ind['rsi_14'])}]
@@ -512,6 +592,7 @@ VOLATILITY & RISK:
 - Bollinger Bands: Upper ${ind['bollinger_upper']:.2f}, Middle ${ind['bollinger_middle']:.2f}, Lower ${ind['bollinger_lower']:.2f}
 - Price Position in BB: {ind['bollinger_position']*100:.1f}% (0%=lower band, 100%=upper band)
 - ATR: {ind['atr']:.2f} ({ind['atr_pct']:.2f}% of price)
+- 10h Returns: {ind['returns_10h_pct']:.2f}%
 - 24h Returns: {ind['returns_24h_pct']:.2f}%
 
 VOLUME:
@@ -527,36 +608,86 @@ LIQUIDITY:
 CURRENT POSITION:
 {position_info}
 
-TRADING INSTRUCTIONS:
+TRADING INSTRUCTIONS (REGIME-SPECIFIC):
 
-1. ANALYZE THE COMPLETE PICTURE:
-   - Is the trend strong and confirmed across multiple indicators?
-   - Is momentum aligned with trend direction?
-   - Is volatility at acceptable levels?
-   - Is there sufficient volume and liquidity?
+📊 CURRENT REGIME: {ind['market_regime']}
 
-2. POSITION MANAGEMENT:
+{"="*60}
+IF MOMENTUM REGIME (current: {'✅ YES' if ind['market_regime'] == 'MOMENTUM' else '❌ NO'}):
+{"="*60}
+Strategy: TREND-FOLLOWING / MOMENTUM TRADING
+
+✅ ENTRY SIGNALS (LONG):
+- Price > MA(20) AND MA(20) > MA(50) (confirmed uptrend)
+- RSI 60-80 is NORMAL in strong trends (NOT overbought!)
+- Price breaking above BB upper band + volume spike = BREAKOUT
+- 10h returns > +2% with volume ratio > 1.2
+- MACD histogram positive and expanding
+
+✅ ENTRY SIGNALS (SHORT):
+- Price < MA(20) AND MA(20) < MA(50) (confirmed downtrend)
+- RSI 20-40 is NORMAL in strong downtrends (NOT oversold!)
+- Price breaking below BB lower band + volume spike = BREAKDOWN
+- 10h returns < -2% with volume ratio > 1.2
+- MACD histogram negative and expanding
+
+🚫 AVOID:
+- Counter-trend trades (don't fade strong momentum)
+- Waiting for "oversold" in uptrend or "overbought" in downtrend
+- Mean reversion signals (they fail in momentum regimes)
+
+Confidence threshold: > 0.55 for entries
+
+{"="*60}
+IF RANGING REGIME (current: {'✅ YES' if ind['market_regime'] == 'RANGING' else '❌ NO'}):
+{"="*60}
+Strategy: MEAN REVERSION
+
+✅ ENTRY SIGNALS (LONG):
+- RSI < 30 (oversold bounce)
+- Price near BB lower band (< 20%)
+- Recent pullback -2% or more
+- Volume declining (exhaustion)
+
+✅ ENTRY SIGNALS (SHORT):
+- RSI > 70 (overbought fade)
+- Price near BB upper band (> 80%)
+- Recent rally +2% or more
+- Volume declining (exhaustion)
+
+🚫 AVOID:
+- Chasing breakouts (likely false in ranging market)
+- Holding through extremes (take quick profits)
+
+Confidence threshold: > 0.60 for entries
+
+{"="*60}
+IF TRANSITIONAL REGIME (current: {'✅ YES' if ind['market_regime'] == 'TRANSITIONAL' else '❌ NO'}):
+{"="*60}
+Strategy: WAIT FOR CLARITY or reduce size
+
+- Only take highest-confidence setups (> 0.70)
+- Prefer closing losing positions
+- Wait for regime to clarify before opening new positions
+
+{"="*60}
+UNIVERSAL RULES (ALL REGIMES):
+{"="*60}
+
+1. POSITION MANAGEMENT:
    - If you have a winning position (>2% profit), consider taking profits
    - If position is losing and technical conditions have reversed, consider closing
-   - Avoid opening new positions in unclear market conditions
+   - Don't open new positions if spread > {spread_pct:.2f}% or volume ratio < 0.5
 
-3. ENTRY CRITERIA FOR NEW POSITIONS:
-   - Strong trend confirmed by MA alignment
-   - RSI not in extreme territory (20-80 range)
-   - MACD histogram supporting the direction
-   - Decent volume (ratio > 0.8)
-   - Only proceed if confidence > 0.75
-
-4. STOP-LOSS & TAKE-PROFIT:
+2. STOP-LOSS & TAKE-PROFIT:
    - Base SL/TP on ATR: Higher volatility = wider stops
    - Suggested SL: {ind['atr_pct']*1.5:.2f}% to {ind['atr_pct']*2.5:.2f}% (1.5-2.5x ATR)
    - Suggested TP: {ind['atr_pct']*2.5:.2f}% to {ind['atr_pct']*4:.2f}% (2.5-4x ATR)
    - Minimum Risk/Reward ratio: 1.5:1
 
-5. RISK CONSIDERATIONS:
-   - Wide spread (>{spread_pct:.2f}%) = Poor execution, avoid trading
-   - Low volume = Less reliable signals
-   - High volatility = Wider stops needed
+3. VOLUME & LIQUIDITY:
+   - Require volume ratio > 0.8 for new positions
+   - Wide spreads = poor execution, skip trade
 
 Respond ONLY with valid JSON in this exact format:
 {{
@@ -568,12 +699,16 @@ Respond ONLY with valid JSON in this exact format:
 }}
 
 CRITICAL RULES:
-- Only suggest OPEN_LONG/OPEN_SHORT if confidence > 0.65
+- Confidence thresholds based on regime:
+  * MOMENTUM: > 0.55 (lower threshold because RSI 70-80 is normal in trends)
+  * RANGING: > 0.60 (slightly higher, more false signals)
+  * TRANSITIONAL: > 0.70 (only take best setups)
 - take_profit_pct should be based on ATR (typically {ind['atr_pct']*2.5:.2f}% to {ind['atr_pct']*4:.2f}%)
 - stop_loss_pct should be based on ATR (typically {ind['atr_pct']*1.5:.2f}% to {ind['atr_pct']*2.5:.2f}%)
 - Ensure TP/SL ratio is at least 1.5:1
-- Don't open positions during unclear market conditions
-- Provide detailed reasoning that references specific indicator values
+- IMPORTANT: In MOMENTUM regime, RSI 70-80 does NOT mean overbought if trend is up!
+- IMPORTANT: In RANGING regime, fade extremes; in MOMENTUM regime, follow breakouts
+- Provide detailed reasoning that references regime, trend, RSI context, and volume
 """
 
         return prompt
