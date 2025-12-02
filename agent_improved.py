@@ -833,6 +833,27 @@ class HyperliquidExecutor:
         self.info = Info(url, skip_ws=True)
 
         logger.info(f"Hyperliquid executor initialized (testnet={testnet})")
+        self.meta = self.info.meta()
+        self.coin_to_asset = {asset['name']: asset for asset in self.meta['universe']}
+
+    def _get_asset_meta(self, symbol: str) -> Optional[Dict]:
+        """Get metadata for a specific asset"""
+        return self.coin_to_asset.get(symbol)
+
+    def _round_size(self, symbol: str, size: float) -> float:
+        """Round size to allowed precision"""
+        meta = self._get_asset_meta(symbol)
+        if not meta:
+            return round(size, 5)  # Default safe fallback
+        
+        decimals = meta['szDecimals']
+        return round(size, decimals)
+
+    def _round_price(self, symbol: str, price: float) -> float:
+        """Round price to allowed precision (usually 5 significant figures or specific tick size)"""
+        # Hyperliquid uses 5 significant figures for prices mostly, but let's be safe with 5 decimals for now
+        # Ideally we should check max decimals allowed
+        return float(f"{price:.5g}")
 
     def get_account_balance(self) -> float:
         """Get account balance in USD"""
@@ -986,12 +1007,15 @@ class HyperliquidExecutor:
         logger.info(f"Opening {side} position: {size_coins:.4f} {symbol} @ ${execution_price:.2f}")
         logger.info(f"TP: {tp_pct:.2f}%, SL: {sl_pct:.2f}%")
 
+        # Round inputs
+        rounded_size = self._round_size(symbol, size_coins)
+        
         try:
             # Place market order
             order = self.exchange.market_open(
                 name=symbol,
                 is_buy=is_buy,
-                sz=size_coins,
+                sz=rounded_size,
                 px=None  # Market order
             )
 
@@ -1008,10 +1032,8 @@ class HyperliquidExecutor:
             logger.info(f"Calculated TP: ${tp_price:.2f}, SL: ${sl_price:.2f}")
 
             # Place TP/SL orders
-            # Note: Implementation depends on Hyperliquid API specifics
-            # This is a placeholder - consult Hyperliquid docs for exact implementation
             try:
-                self._place_tp_sl_orders(symbol, size_coins, tp_price, sl_price, is_buy)
+                self._place_tp_sl_orders(symbol, rounded_size, tp_price, sl_price, is_buy)
             except Exception as e:
                 logger.error(f"Failed to place TP/SL orders: {e}")
                 logger.warning("Position opened but TP/SL not set - MANUAL MONITORING REQUIRED")
@@ -1031,13 +1053,18 @@ class HyperliquidExecutor:
         Consult Hyperliquid API documentation for exact implementation.
         """
 
+        # Round prices
+        rounded_tp = self._round_price(symbol, tp_price)
+        rounded_sl = self._round_price(symbol, sl_price)
+        rounded_size = self._round_size(symbol, size)
+
         # Take Profit (limit order on opposite side)
         try:
             tp_order = self.exchange.order(
                 name=symbol,
                 is_buy=not is_buy,  # Opposite side to close
-                sz=size,
-                limit_px=tp_price,
+                sz=rounded_size,
+                limit_px=rounded_tp,
                 order_type={"limit": {"tif": "Gtc"}},  # Good-til-canceled
                 reduce_only=True
             )
@@ -1050,9 +1077,9 @@ class HyperliquidExecutor:
             sl_order = self.exchange.order(
                 name=symbol,
                 is_buy=not is_buy,  # Opposite side to close
-                sz=size,
-                limit_px=sl_price,
-                order_type={"trigger": {"triggerPx": sl_price, "isMarket": True, "tpsl": "sl"}},
+                sz=rounded_size,
+                limit_px=rounded_sl,
+                order_type={"trigger": {"triggerPx": rounded_sl, "isMarket": True, "tpsl": "sl"}},
                 reduce_only=True
             )
             logger.info(f"SL order placed: {sl_order}")
