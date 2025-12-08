@@ -45,7 +45,9 @@ class RiskManager:
                  max_daily_loss_pct: float = 5.0,
                  max_position_size_pct: float = 10.0,
                  min_account_balance_usd: float = 100.0,
-                 max_spread_bps: float = 50.0):
+                 max_spread_bps: float = 50.0,
+                 max_weekly_loss_pct: float = 10.0,
+                 max_consecutive_losses: int = 3):
         """
         Initialize risk manager
 
@@ -54,22 +56,36 @@ class RiskManager:
             max_position_size_pct: Maximum position size as % of account
             min_account_balance_usd: Minimum account balance required to trade
             max_spread_bps: Maximum allowed spread in basis points
+            max_weekly_loss_pct: Maximum weekly loss percentage before circuit breaker
+            max_consecutive_losses: Maximum consecutive losing trades before reducing size
         """
         self.max_daily_loss_pct = max_daily_loss_pct
         self.max_position_size_pct = max_position_size_pct
         self.min_account_balance_usd = min_account_balance_usd
         self.max_spread_bps = max_spread_bps
+        self.max_weekly_loss_pct = max_weekly_loss_pct
+        self.max_consecutive_losses = max_consecutive_losses
 
         # Track daily P&L - Initialize BEFORE loading state
         self.daily_pnl_usd = 0.0
         self.last_reset_date = datetime.now().date()
         self.last_reset_time = datetime.now()
         self.trades_today = 0
+        
+        # Enhanced drawdown protection (P6)
+        self.weekly_pnl_usd = 0.0
+        self.week_start_date = self._get_week_start()
+        self.consecutive_losses = 0
 
         # Load saved state (will overwrite defaults if exists)
         self.load_state()
 
-        logger.info(f"RiskManager initialized: max_daily_loss={max_daily_loss_pct}%, max_position={max_position_size_pct}%")
+        logger.info(f"RiskManager initialized: max_daily_loss={max_daily_loss_pct}%, max_weekly_loss={max_weekly_loss_pct}%, max_consecutive_losses={max_consecutive_losses}")
+
+    def _get_week_start(self) -> datetime:
+        """Get the start of the current week (Monday)"""
+        today = datetime.now()
+        return today - timedelta(days=today.weekday())
 
     def reset_daily_limits(self):
         """Reset daily limits at start of new day"""
@@ -81,6 +97,48 @@ class RiskManager:
             self.last_reset_date = current_date
             self.last_reset_time = datetime.now()
             self.save_state()  # Persist the reset
+    
+    def reset_weekly_limits(self):
+        """Reset weekly limits at start of new week"""
+        current_week_start = self._get_week_start().date()
+        if current_week_start > self.week_start_date.date():
+            logger.info(f"Resetting weekly limits. Previous weekly P&L: ${self.weekly_pnl_usd:.2f}")
+            self.weekly_pnl_usd = 0.0
+            self.week_start_date = self._get_week_start()
+            self.save_state()
+    
+    def check_weekly_loss_limit(self, account_balance: float) -> bool:
+        """Check if weekly loss limit exceeded"""
+        self.reset_weekly_limits()
+        
+        loss_pct = (self.weekly_pnl_usd / account_balance) * 100 if account_balance > 0 else 0
+        
+        if loss_pct <= -self.max_weekly_loss_pct:
+            logger.error(f"CIRCUIT BREAKER: Weekly loss limit exceeded ({loss_pct:.2f}% < -{self.max_weekly_loss_pct}%)")
+            return False
+        
+        return True
+    
+    def check_consecutive_losses(self) -> bool:
+        """Check if consecutive loss limit exceeded"""
+        if self.consecutive_losses >= self.max_consecutive_losses:
+            logger.warning(f"CONSECUTIVE LOSS LIMIT: {self.consecutive_losses} losses in a row - reducing position size")
+            return False
+        return True
+    
+    def get_position_size_multiplier(self) -> float:
+        """
+        Get position size multiplier based on consecutive losses.
+        Reduces position size after consecutive losses to limit drawdown.
+        """
+        if self.consecutive_losses == 0:
+            return 1.0
+        elif self.consecutive_losses == 1:
+            return 0.75  # 75% size after 1 loss
+        elif self.consecutive_losses == 2:
+            return 0.5   # 50% size after 2 losses
+        else:
+            return 0.25  # 25% size after 3+ losses
 
     def check_daily_loss_limit(self, account_balance: float) -> bool:
         """Check if daily loss limit exceeded"""
@@ -151,20 +209,178 @@ class RiskManager:
         return True
 
     def calculate_position_size(self, account_balance: float, price: float) -> float:
-        """Calculate safe position size based on account balance"""
-        max_position_usd = account_balance * (self.max_position_size_pct / 100)
+        """Calculate safe position size based on account balance with consecutive loss adjustment"""
+        # Apply consecutive loss multiplier to reduce risk after losses
+        size_multiplier = self.get_position_size_multiplier()
+        effective_position_pct = self.max_position_size_pct * size_multiplier
+        
+        max_position_usd = account_balance * (effective_position_pct / 100)
         position_coins = max_position_usd / price
 
+        if size_multiplier < 1.0:
+            logger.warning(f"Position size reduced due to {self.consecutive_losses} consecutive losses (multiplier: {size_multiplier:.0%})")
+        
         logger.info(f"Position sizing: Account=${account_balance:.2f}, Max position=${max_position_usd:.2f}, Coins={position_coins:.4f}")
 
         return position_coins
 
     def record_trade(self, pnl_usd: float):
-        """Record trade result for daily tracking"""
+        """Record trade result for daily/weekly tracking and consecutive loss handling"""
         self.daily_pnl_usd += pnl_usd
+        self.weekly_pnl_usd += pnl_usd
         self.trades_today += 1
-        logger.info(f"Trade recorded: P&L=${pnl_usd:.2f}, Daily total=${self.daily_pnl_usd:.2f}, Trades today={self.trades_today}")
+        
+        # Track consecutive losses
+        if pnl_usd < 0:
+            self.consecutive_losses += 1
+            logger.info(f"Losing trade recorded. Consecutive losses: {self.consecutive_losses}")
+        else:
+            if self.consecutive_losses > 0:
+                logger.info(f"Winning trade breaks {self.consecutive_losses} loss streak")
+            self.consecutive_losses = 0
+        
+        logger.info(f"Trade recorded: P&L=${pnl_usd:.2f}, Daily=${self.daily_pnl_usd:.2f}, Weekly=${self.weekly_pnl_usd:.2f}")
         self.save_state()  # Persist state after each trade
+
+
+class OrderTracker:
+    """
+    Track open orders and positions with exchange reconciliation.
+    
+    This class ensures the bot's internal state matches reality by:
+    1. Recording all placed orders (entry, TP, SL)
+    2. Periodically reconciling with exchange state
+    3. Detecting when positions close externally (TP/SL hit)
+    """
+    
+    def __init__(self):
+        self.open_orders: Dict[str, Dict] = {}  # order_id -> order_details
+        self.active_position: Optional[Dict] = None
+        self.last_sync_time: Optional[datetime] = None
+        self.position_history: List[Dict] = []
+        logger.info("OrderTracker initialized")
+    
+    def record_order(self, order_id: str, order_type: str, symbol: str, 
+                     side: str, price: float, size: float) -> None:
+        """Record a placed order"""
+        self.open_orders[order_id] = {
+            'type': order_type,  # 'ENTRY', 'TP', 'SL'
+            'symbol': symbol,
+            'side': side,
+            'price': price,
+            'size': size,
+            'status': 'OPEN',
+            'placed_at': datetime.now(),
+            'updated_at': None
+        }
+        logger.info(f"Order recorded: {order_type} {side} {size:.4f} @ ${price:.2f} (ID: {order_id[:8]}...)")
+    
+    def update_order_status(self, order_id: str, status: str) -> None:
+        """Update order status (FILLED, CANCELED, MISSING, etc.)"""
+        if order_id in self.open_orders:
+            self.open_orders[order_id]['status'] = status
+            self.open_orders[order_id]['updated_at'] = datetime.now()
+            logger.info(f"Order {order_id[:8]}... status updated to: {status}")
+    
+    def record_position_open(self, symbol: str, side: str, size: float, 
+                              entry_price: float) -> None:
+        """Record a newly opened position"""
+        self.active_position = {
+            'symbol': symbol,
+            'side': side,
+            'size': size,
+            'entry_price': entry_price,
+            'opened_at': datetime.now(),
+            'tp_order_id': None,
+            'sl_order_id': None
+        }
+        logger.info(f"Position recorded: {side} {size:.4f} {symbol} @ ${entry_price:.2f}")
+    
+    def record_tp_sl_orders(self, tp_order_id: Optional[str], sl_order_id: Optional[str]) -> None:
+        """Associate TP/SL orders with the active position"""
+        if self.active_position:
+            self.active_position['tp_order_id'] = tp_order_id
+            self.active_position['sl_order_id'] = sl_order_id
+            logger.info(f"TP/SL orders associated with position")
+    
+    def record_position_close(self, exit_price: float, pnl_usd: float, 
+                               close_reason: str = "MANUAL") -> None:
+        """Record a closed position"""
+        if self.active_position:
+            closed_position = {
+                **self.active_position,
+                'exit_price': exit_price,
+                'pnl_usd': pnl_usd,
+                'close_reason': close_reason,  # 'TP', 'SL', 'MANUAL', 'EXTERNAL'
+                'closed_at': datetime.now()
+            }
+            self.position_history.append(closed_position)
+            logger.info(f"Position closed ({close_reason}): P&L=${pnl_usd:.2f}")
+            self.active_position = None
+            self.open_orders.clear()
+    
+    def reconcile_with_exchange(self, exchange_position: Optional[Dict], 
+                                  exchange_orders: List[Dict]) -> Dict:
+        """
+        Sync internal state with exchange reality.
+        
+        Returns:
+            Dict with reconciliation results
+        """
+        result = {
+            'position_matched': True,
+            'orders_matched': True,
+            'position_closed_externally': False,
+            'missing_orders': []
+        }
+        
+        self.last_sync_time = datetime.now()
+        
+        # Check if we think we have a position but exchange says no
+        if self.active_position and not exchange_position:
+            logger.warning("⚠️ Position closed externally (TP/SL likely hit)")
+            result['position_closed_externally'] = True
+            result['position_matched'] = False
+            
+            # Try to determine close price from order history (best effort)
+            # For now, clear the position
+            self.record_position_close(
+                exit_price=0.0,  # Unknown
+                pnl_usd=0.0,     # Unknown - will need to query
+                close_reason="EXTERNAL"
+            )
+        
+        # Check if exchange has position but we don't track it
+        if exchange_position and not self.active_position:
+            logger.warning("⚠️ Unknown position detected on exchange - syncing")
+            self.record_position_open(
+                symbol=exchange_position.get('symbol', 'BTC'),
+                side=exchange_position.get('side', 'UNKNOWN'),
+                size=exchange_position.get('size', 0),
+                entry_price=exchange_position.get('entry_price', 0)
+            )
+            result['position_matched'] = False
+        
+        # Verify our tracked orders still exist on exchange
+        if self.active_position and self.open_orders:
+            exchange_order_ids = {o.get('oid', o.get('id', '')) for o in exchange_orders}
+            
+            for order_id in list(self.open_orders.keys()):
+                if order_id not in exchange_order_ids:
+                    logger.warning(f"Order {order_id[:8]}... no longer exists (filled or canceled)")
+                    self.update_order_status(order_id, 'MISSING')
+                    result['missing_orders'].append(order_id)
+                    result['orders_matched'] = False
+        
+        return result
+    
+    def has_active_position(self) -> bool:
+        """Check if we're tracking an active position"""
+        return self.active_position is not None
+    
+    def get_position_summary(self) -> Optional[Dict]:
+        """Get summary of active position"""
+        return self.active_position
 
 
 class PerformanceTracker:
@@ -249,8 +465,15 @@ class MarketDataCollector:
     """Fetch and process market data from Hyperliquid"""
 
     def __init__(self, testnet: bool = True):
+        self.testnet = testnet
         url = constants.TESTNET_API_URL if testnet else constants.MAINNET_API_URL
         self.info = Info(url, skip_ws=True)
+        
+        # Volume thresholds: testnet has naturally low volume, so we use relaxed thresholds
+        # Best practice: 0.3x for testnet (allows trading with 30% of avg volume)
+        # Production: 0.8x (requires 80% of avg volume for reliable signals)
+        self.min_volume_ratio = 0.3 if testnet else 0.8
+        logger.info(f"MarketDataCollector initialized (testnet={testnet}, min_volume_ratio={self.min_volume_ratio})")
 
     def get_market_snapshot(self, symbol: str = "BTC") -> Dict:
         """Get comprehensive market snapshot with indicators"""
@@ -282,8 +505,86 @@ class MarketDataCollector:
         df['open'] = pd.to_numeric(df['open'])
         df['volume'] = pd.to_numeric(df['volume'])
 
-        # Calculate indicators
+        # ==================== DATA VALIDATION ====================
+        # VALIDATION 1: Data freshness (latest candle should be < 10 minutes old)
+        latest_timestamp = df['timestamp'].iloc[-1]
+        age_ms = int(time.time() * 1000) - latest_timestamp
+        age_minutes = age_ms / 60000
+        if age_minutes > 10:
+            logger.warning(f"Stale data detected: latest candle is {age_minutes:.1f} minutes old")
+            # Don't raise for testnet, but log warning; raise for production
+            if not self.testnet:
+                raise ValueError(f"Stale data: latest candle is {age_minutes:.1f} minutes old")
+        
+        # VALIDATION 2: Price sanity (no zero or negative prices)
+        if (df['close'] <= 0).any() or (df['high'] <= 0).any() or (df['low'] <= 0).any():
+            raise ValueError("Zero or negative prices detected in candle data")
+        
+        # VALIDATION 3: Frozen feed detection (too many duplicate prices = frozen feed)
+        unique_closes = df['close'].nunique()
+        if unique_closes < len(df) * 0.1:  # Less than 10% unique prices
+            raise ValueError(f"Price feed appears frozen: only {unique_closes}/{len(df)} unique prices")
+        
+        # VALIDATION 4: Extreme price movements (> 30% single candle = likely bad data)
+        returns = df['close'].pct_change()
+        if (returns.abs() > 0.30).any():
+            extreme_count = (returns.abs() > 0.30).sum()
+            logger.warning(f"Extreme price movement detected: {extreme_count} candles with >30% moves")
+            # Log but don't block - could be real market events
+        # ==================== END VALIDATION ====================
+
+        # Calculate 1h indicators
         indicators = self._calculate_indicators(df)
+
+        # ==================== MULTI-TIMEFRAME: 4H CANDLES ====================
+        # Fetch 4h candles for higher timeframe confirmation
+        try:
+            candles_4h = self.info.candles_snapshot(
+                name=symbol,
+                interval="4h",
+                startTime=end_time - (25 * 4 * 3600 * 1000),  # 25 candles * 4h
+                endTime=end_time
+            )
+            
+            if candles_4h and len(candles_4h) >= 15:
+                df_4h = pd.DataFrame(candles_4h)
+                df_4h = df_4h.rename(columns={'t': 'timestamp', 'o': 'open', 'h': 'high', 'l': 'low', 'c': 'close', 'v': 'volume'})
+                df_4h['close'] = pd.to_numeric(df_4h['close'])
+                df_4h['high'] = pd.to_numeric(df_4h['high'])
+                df_4h['low'] = pd.to_numeric(df_4h['low'])
+                df_4h['open'] = pd.to_numeric(df_4h['open'])
+                df_4h['volume'] = pd.to_numeric(df_4h['volume'])
+                
+                indicators_4h = self._calculate_indicators(df_4h)
+                
+                # Determine combined regime
+                final_regime, alignment = self._determine_final_regime(
+                    indicators['market_regime'],
+                    indicators_4h['market_regime'],
+                    indicators['momentum_score'],
+                    indicators_4h['momentum_score']
+                )
+                
+                # Add 4h data to indicators
+                indicators['regime_4h'] = indicators_4h['market_regime']
+                indicators['momentum_score_4h'] = indicators_4h['momentum_score']
+                indicators['trend_4h'] = indicators_4h['trend']
+                indicators['rsi_4h'] = indicators_4h['rsi_14']
+                indicators['final_regime'] = final_regime
+                indicators['regime_alignment'] = alignment
+                
+                logger.info(f"Multi-TF: 1h={indicators['market_regime']}, 4h={indicators_4h['market_regime']}, Final={final_regime} ({alignment})")
+            else:
+                logger.warning(f"Insufficient 4h data ({len(candles_4h) if candles_4h else 0} candles), using 1h regime only")
+                indicators['regime_4h'] = None
+                indicators['final_regime'] = indicators['market_regime']
+                indicators['regime_alignment'] = "SINGLE_TF"
+        except Exception as e:
+            logger.warning(f"Failed to fetch 4h candles: {e}. Using 1h regime only.")
+            indicators['regime_4h'] = None
+            indicators['final_regime'] = indicators['market_regime']
+            indicators['regime_alignment'] = "SINGLE_TF"
+        # ==================== END MULTI-TIMEFRAME ====================
 
         # Get orderbook
         book = self.info.l2_snapshot(symbol)
@@ -339,11 +640,52 @@ class MarketDataCollector:
                 'bid_depth_10': bid_depth,
                 'ask_depth_10': ask_depth,
             },
-            'recent_candles': df[['close', 'volume']].tail(5).to_dict('records')
+            'recent_candles': df[['close', 'volume']].tail(5).to_dict('records'),
+            'min_volume_ratio': self.min_volume_ratio,
+            'is_testnet': self.testnet
         }
 
         logger.info(f"Market snapshot collected for {symbol}: ${snapshot['current_price']:.2f}")
         return snapshot
+
+    def _determine_final_regime(self, regime_1h: str, regime_4h: str, 
+                                  score_1h: int, score_4h: int) -> tuple:
+        """
+        Combine 1h and 4h regimes for more robust classification.
+        
+        Logic:
+        - If both agree → high confidence (ALIGNED)
+        - If 4h is MOMENTUM but 1h is TRANSITIONAL → pullback in trend (PULLBACK)
+        - If 4h is MOMENTUM but 1h is RANGING → consolidation in trend (CONSOLIDATING)
+        - If 4h is RANGING but 1h is MOMENTUM → likely false breakout (FALSE_BREAKOUT)
+        - Default: respect higher timeframe (HTF_OVERRIDE)
+        
+        Returns:
+            (final_regime, alignment_status)
+        """
+        
+        # Both timeframes agree - strongest signal
+        if regime_1h == regime_4h:
+            return regime_1h, "ALIGNED"
+        
+        # 4h momentum, 1h pullback = opportunity to enter with trend
+        if regime_4h == "MOMENTUM" and regime_1h == "TRANSITIONAL":
+            return "MOMENTUM", "PULLBACK"
+        
+        # 4h momentum, 1h ranging = consolidation in trend, wait for breakout
+        if regime_4h == "MOMENTUM" and regime_1h == "RANGING":
+            return "TRANSITIONAL", "CONSOLIDATING"
+        
+        # 4h ranging, 1h momentum = likely false breakout, dangerous!
+        if regime_4h == "RANGING" and regime_1h == "MOMENTUM":
+            return "RANGING", "FALSE_BREAKOUT"
+        
+        # 4h transitional cases - generally wait for clarity
+        if regime_4h == "TRANSITIONAL":
+            return "TRANSITIONAL", "HTF_UNCLEAR"
+        
+        # Default: respect higher timeframe
+        return regime_4h, "HTF_OVERRIDE"
 
     def _calculate_indicators(self, df: pd.DataFrame) -> Dict:
         """Calculate technical indicators"""
@@ -398,7 +740,6 @@ class MarketDataCollector:
         # Volume analysis
         volume_ma_20 = volume.rolling(20).mean().iloc[-1]
         volume_ratio = volume.iloc[-1] / volume_ma_20 if volume_ma_20 > 0 else 1.0
-        logger.info(f"Volume debug - Current: {volume.iloc[-1]:.2f}, MA(20): {volume_ma_20:.2f}, Ratio: {volume_ratio:.2f}")
 
         # Price momentum
         returns_24h = ((close.iloc[-1] - close.iloc[-24]) / close.iloc[-24] * 100) if len(close) >= 24 else 0
@@ -406,17 +747,26 @@ class MarketDataCollector:
         # Price momentum over 10 hours (for regime detection)
         returns_10h = ((close.iloc[-1] - close.iloc[-10]) / close.iloc[-10] * 100) if len(close) >= 10 else 0
 
-        # MARKET REGIME DETECTION
-        # Momentum regime: strong directional move with volume
-        # Mean reversion regime: range-bound, low momentum
-        # Transitional: mixed signals
+        # MARKET REGIME DETECTION (ATR-NORMALIZED)
+        # Volatility scales with sqrt of time: 10h expected move = ATR * sqrt(10) ≈ 3.16x ATR
+        # This adapts thresholds to current market volatility
+        expected_10h_move = atr_pct * 3.16  # sqrt(10) for proper volatility scaling
+        
+        # Normalize returns by expected volatility
+        if expected_10h_move > 0:
+            normalized_returns = abs(returns_10h) / expected_10h_move
+        else:
+            normalized_returns = 0
+        
+        logger.debug(f"ATR normalization - 10h returns: {returns_10h:.2f}%, Expected move: {expected_10h_move:.2f}%, Normalized: {normalized_returns:.2f}x")
 
         momentum_score = 0
 
-        # Factor 1: Price change magnitude (10h)
-        if abs(returns_10h) > 3.0:  # >3% move in 10 hours
+        # Factor 1: Price change magnitude (ATR-NORMALIZED)
+        # 2x expected volatility = strong momentum, 1x = moderate
+        if normalized_returns > 2.0:  # >2x expected move = strong momentum
             momentum_score += 2
-        elif abs(returns_10h) > 1.5:  # >1.5% move
+        elif normalized_returns > 1.0:  # >1x expected move = moderate momentum
             momentum_score += 1
 
         # Factor 2: RSI trending (not bouncing at extremes)
@@ -427,9 +777,9 @@ class MarketDataCollector:
         elif 30 <= rsi <= 70:  # RSI in middle = ranging
             momentum_score -= 1
 
-        # Factor 3: Bollinger Band position
+        # Factor 3: Bollinger Band position (ATR-NORMALIZED)
         if bb_position > 0.8 or bb_position < 0.2:  # Near extremes
-            if abs(returns_10h) > 2.0:  # With momentum = breakout
+            if normalized_returns > 1.5:  # With momentum = breakout (1.5x expected)
                 momentum_score += 2
             else:  # Without momentum = reversal zone
                 momentum_score -= 1
@@ -440,10 +790,10 @@ class MarketDataCollector:
         elif volume_ratio < 0.7:  # Low volume = ranging
             momentum_score -= 1
 
-        # Factor 5: Trend alignment
-        if trend == "BULLISH" and returns_10h > 1.0:
+        # Factor 5: Trend alignment (ATR-NORMALIZED)
+        if trend == "BULLISH" and normalized_returns > 0.5 and returns_10h > 0:
             momentum_score += 1
-        elif trend == "BEARISH" and returns_10h < -1.0:
+        elif trend == "BEARISH" and normalized_returns > 0.5 and returns_10h < 0:
             momentum_score += 1
         elif trend == "MIXED":
             momentum_score -= 1
@@ -476,6 +826,8 @@ class MarketDataCollector:
             'volume_ratio': float(volume_ratio),
             'returns_24h_pct': float(returns_24h),
             'returns_10h_pct': float(returns_10h),
+            'normalized_returns': float(normalized_returns),
+            'expected_10h_move': float(expected_10h_move),
             'market_regime': market_regime,
             'momentum_score': momentum_score
         }
@@ -571,7 +923,20 @@ MARKET DATA FOR {market_data['symbol']}:
 - Current Price: ${market_data['current_price']:.2f}
 - Timestamp: {market_data['timestamp']}
 
-🎯 MARKET REGIME: {ind['market_regime']} (Score: {ind.get('momentum_score', 0)})
+🎯 MARKET REGIME (MULTI-TIMEFRAME):
+- 1-Hour Regime: {ind['market_regime']} (Score: {ind.get('momentum_score', 0)})
+- 4-Hour Regime: {ind.get('regime_4h', 'N/A')} (Score: {ind.get('momentum_score_4h', 'N/A')})
+- FINAL REGIME: {ind.get('final_regime', ind['market_regime'])}
+- Alignment: {ind.get('regime_alignment', 'SINGLE_TF')}
+
+⚠️ REGIME ALIGNMENT RULES:
+- ALIGNED: Both timeframes agree - HIGHEST confidence trades, trade aggressively
+- PULLBACK: 4h momentum + 1h transitional - GOOD entry for trend continuation
+- CONSOLIDATING: 4h momentum + 1h ranging - Wait for breakout confirmation
+- FALSE_BREAKOUT: 4h ranging + 1h momentum - DANGER! Likely trap, SKIP trade
+- HTF_OVERRIDE: Respect the 4h timeframe direction
+
+REGIME TYPES:
 - MOMENTUM: Strong directional move - trade with the trend, RSI 70-80 is normal
 - RANGING: Sideways choppy action - mean reversion, buy dips/sell rallies
 - TRANSITIONAL: Mixed signals - wait for clarity or reduce position size
@@ -612,10 +977,10 @@ CURRENT POSITION:
 
 TRADING INSTRUCTIONS (REGIME-SPECIFIC):
 
-📊 CURRENT REGIME: {ind['market_regime']}
+📊 FINAL REGIME: {ind.get('final_regime', ind['market_regime'])} (Alignment: {ind.get('regime_alignment', 'SINGLE_TF')})
 
 {"="*60}
-IF MOMENTUM REGIME (current: {'✅ YES' if ind['market_regime'] == 'MOMENTUM' else '❌ NO'}):
+IF MOMENTUM REGIME (current: {'✅ YES' if ind.get('final_regime', ind['market_regime']) == 'MOMENTUM' else '❌ NO'}):
 {"="*60}
 Strategy: TREND-FOLLOWING / MOMENTUM TRADING
 
@@ -641,7 +1006,7 @@ Strategy: TREND-FOLLOWING / MOMENTUM TRADING
 Confidence threshold: > 0.55 for entries
 
 {"="*60}
-IF RANGING REGIME (current: {'✅ YES' if ind['market_regime'] == 'RANGING' else '❌ NO'}):
+IF RANGING REGIME (current: {'✅ YES' if ind.get('final_regime', ind['market_regime']) == 'RANGING' else '❌ NO'}):
 {"="*60}
 Strategy: MEAN REVERSION
 
@@ -664,7 +1029,7 @@ Strategy: MEAN REVERSION
 Confidence threshold: > 0.60 for entries
 
 {"="*60}
-IF TRANSITIONAL REGIME (current: {'✅ YES' if ind['market_regime'] == 'TRANSITIONAL' else '❌ NO'}):
+IF TRANSITIONAL REGIME (current: {'✅ YES' if ind.get('final_regime', ind['market_regime']) == 'TRANSITIONAL' else '❌ NO'}):
 {"="*60}
 Strategy: WAIT FOR CLARITY or reduce size
 
@@ -688,7 +1053,7 @@ UNIVERSAL RULES (ALL REGIMES):
    - Minimum Risk/Reward ratio: 1.5:1
 
 3. VOLUME & LIQUIDITY:
-   - Require volume ratio > 0.8 for new positions
+   - Require volume ratio > {market_data.get('min_volume_ratio', 0.8)} for new positions {'(TESTNET MODE: relaxed threshold)' if market_data.get('is_testnet', False) else ''}
    - Wide spreads = poor execution, skip trade
 
 Respond ONLY with valid JSON in this exact format:
@@ -1174,6 +1539,7 @@ class LLMTradingAgent:
             max_spread_bps=max_spread_bps
         )
         self.performance_tracker = PerformanceTracker()
+        self.order_tracker = OrderTracker()  # Track orders and positions
 
         logger.success("LLM Trading Agent (IMPROVED) initialized")
         logger.info(f"Symbol: {symbol}, Position Size: {position_size_pct}% of account")
@@ -1210,8 +1576,19 @@ class LLMTradingAgent:
                 logger.warning("Spread too wide - skipping iteration")
                 return {'skipped': 'Wide spread'}
 
-            # 5. Get current position
+            # 5. Get current position and reconcile with order tracker
             current_position = self.executor.get_current_position(self.symbol)
+            
+            # Reconcile order tracker with exchange state
+            # This detects if TP/SL hit externally
+            reconcile_result = self.order_tracker.reconcile_with_exchange(
+                exchange_position=current_position,
+                exchange_orders=[]  # TODO: fetch open orders from exchange
+            )
+            
+            if reconcile_result.get('position_closed_externally'):
+                logger.info("Position was closed externally (TP/SL hit) - will update tracking")
+            
             if current_position:
                 logger.info(f"Current position: {current_position['side']} {current_position['size']:.4f} @ ${current_position['entry_price']:.2f}, P&L: {current_position['pnl_pct']:.2f}%")
 

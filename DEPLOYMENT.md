@@ -125,11 +125,21 @@ Railway is an easier alternative to a VPS.
 ### 4. ⚠️ CRITICAL: Persist Data
 Railway files are ephemeral (deleted on restart). You **MUST** create a Volume to save your trade history.
 
-1.  In your service view, go to **"Volumes"**.
-2.  Click **"Add Volume"**.
+1.  Click on your **Service** (the card with your repo name) in the Railway canvas.
+2.  Look at the tabs at the top (Deployments, Variables, Settings, etc.). Click **"Volumes"**.
+    *   *Note: If you don't see "Volumes", check under "Settings" or look for a "Storage" section.*
+3.  Click **"Add Volume"** (or "New Volume").
+    *   **Pro Tip**: Press `Cmd + K` (Mac) or `Ctrl + K` (Windows) in Railway and type "Add Volume" to find it instantly.
 3.  Mount path: `/app/data`
 4.  This ensures `risk_state.json` and trade history are saved even if the bot restarts.
 
 ### 5. Deploy
 Railway will automatically redeploy when you push changes to GitHub.
+
+### Troubleshooting: "Healthcheck Failed"
+If you see "Healthcheck failed", it's because Railway expects a web server by default.
+1.  Go to **Settings** -> **Deploy**.
+2.  Remove the **Healthcheck Path** (make it empty).
+3.  Or, ensure your `railway.toml` does NOT have `healthcheckPath` defined.
+
 

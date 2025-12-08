@@ -1,6 +1,8 @@
 # Environment variables (Sensitive!)
 .env
-.env.local
+.env*
+*.env
+
 
 # Data and Logs
 data/
